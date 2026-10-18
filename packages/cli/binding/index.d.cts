@@ -4179,7 +4179,6 @@ export declare namespace oxcNode {
     transform(path: string, source: string | Uint8Array): oxcNode.TransformOutput;
   }
   export function createResolve(
-    options: OxcResolveOptions,
     specifier: string,
     context: ResolveContext,
     nextResolve: (
