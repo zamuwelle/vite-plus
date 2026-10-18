@@ -111,18 +111,38 @@ pub fn build_command(bin_path: &AbsolutePath, cwd: &AbsolutePath) -> Command {
 /// is interrupted (e.g., via Ctrl+C) while the terminal is in a non-standard state.
 ///
 /// On Unix, saves the terminal state before spawning the child process and restores
-/// it after the child exits. On Windows, this is a simple pass-through.
+/// it after the child exits. While the child runs, SIGINT, SIGTERM, and SIGHUP
+/// received by this process are forwarded to the child, and this process keeps
+/// waiting for it: stopping `vp` alone (with `kill`, a supervisor, or a
+/// container runtime) must stop the command `vp` started, such as a dev server
+/// or a `vp run` process with its tasks, instead of leaving it behind.
+///
+/// On Windows, this is a simple pass-through.
 pub async fn execute_with_terminal_guard(mut cmd: Command) -> Result<ExitStatus, Error> {
     #[cfg(unix)]
     {
         use nix::libc::STDIN_FILENO;
 
-        // Save terminal state and ignore sigint signal for current process before spawning child
-        let _guard = TerminalStateGuard::save(STDIN_FILENO);
+        // Install the signal handlers before spawning, so a signal that
+        // arrives right after the spawn is forwarded instead of dropped.
+        let signal_guard = SignalForwardingGuard::install();
 
-        // Spawn and wait for child - guard will restore terminal state on drop
+        // Save the terminal state before spawning; the guard restores it on drop.
+        let _terminal_guard = TerminalStateGuard::save(STDIN_FILENO);
+
+        // Spawn and wait for the child.
         let mut child = cmd.spawn().map_err(|e| Error::Anyhow(e.into()))?;
-        child.wait().await.map_err(|e| Error::Anyhow(e.into()))
+        if let Some(signal_guard) = signal_guard.as_ref() {
+            signal_guard.set_child_pid(child.id());
+        }
+
+        let status = child.wait().await.map_err(|e| Error::Anyhow(e.into()))?;
+
+        // Stop forwarding once the child has exited and its pid can be reused.
+        if let Some(signal_guard) = signal_guard.as_ref() {
+            signal_guard.clear_child_pid();
+        }
+        Ok(status)
     }
 
     #[cfg(not(unix))]
@@ -336,7 +356,6 @@ pub fn fix_stdio_streams() {
 struct TerminalStateGuard {
     fd: RawFd,
     original: nix::sys::termios::Termios,
-    original_sigint: Option<nix::sys::signal::SigAction>,
 }
 
 #[cfg(unix)]
@@ -355,39 +374,132 @@ impl TerminalStateGuard {
         }
 
         match tcgetattr(borrowed_fd) {
-            Ok(original) => Some(Self { fd, original, original_sigint: Self::ignore_sigint() }),
+            Ok(original) => Some(Self { fd, original }),
             Err(_) => None,
         }
-    }
-
-    fn ignore_sigint() -> Option<nix::sys::signal::SigAction> {
-        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-
-        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-        // SAFETY: installs a process signal disposition for SIGINT and returns
-        // the previous disposition, which this guard restores on drop.
-        unsafe { sigaction(Signal::SIGINT, &ignore).ok() }
     }
 }
 
 #[cfg(unix)]
 impl Drop for TerminalStateGuard {
     fn drop(&mut self) {
-        use nix::sys::{
-            signal::{Signal, sigaction},
-            termios::{SetArg, tcsetattr},
-        };
+        use nix::sys::termios::{SetArg, tcsetattr};
 
         // SAFETY: fd comes from stdin/stdout/stderr and the guard does not outlive the process
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
 
         // Best effort: ignore errors during cleanup
         let _ = tcsetattr(borrowed_fd, SetArg::TCSANOW, &self.original);
+    }
+}
 
-        // SAFETY: restores the signal disposition captured by save().
-        if let Some(original_sigint) = self.original_sigint.take() {
-            let _ = unsafe { sigaction(Signal::SIGINT, &original_sigint) };
+/// Termination signals forwarded to the guarded child process.
+#[cfg(unix)]
+const FORWARDED_SIGNALS: [nix::sys::signal::Signal; 3] = [
+    nix::sys::signal::Signal::SIGINT,
+    nix::sys::signal::Signal::SIGTERM,
+    nix::sys::signal::Signal::SIGHUP,
+];
+
+/// PID of the child a forwarded signal goes to; zero when none is running.
+///
+/// Only a plain atomic and `kill` (both async-signal-safe) run inside the
+/// signal handler, so this cannot be a lock or a richer data structure.
+#[cfg(unix)]
+static FORWARDED_CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Forwards a termination signal received by this process to the guarded child.
+///
+/// Falls back to the default disposition when no child is running, so signals
+/// received outside the guarded window keep terminating this process.
+#[cfg(unix)]
+extern "C" fn forward_termination_signal(signal: i32) {
+    use std::sync::atomic::Ordering;
+
+    let pid = FORWARDED_CHILD_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        // SAFETY: `kill` is async-signal-safe, and the pid is cleared when the
+        // child exits so it cannot name an unrelated reused process.
+        unsafe { nix::libc::kill(pid, signal) };
+    } else {
+        // SAFETY: resetting a caught signal to its default disposition and
+        // re-raising it is the standard way to emulate the default action.
+        unsafe {
+            nix::libc::signal(signal, nix::libc::SIG_DFL);
+            nix::libc::raise(signal);
         }
+    }
+}
+
+/// Forwards SIGINT, SIGTERM, and SIGHUP received by this process to the child
+/// it is waiting for.
+///
+/// The previous dispositions are saved and restored on drop, so the
+/// surrounding process (for example, the Node.js CLI the binding runs in)
+/// keeps its own signal handling outside the guarded window.
+#[cfg(unix)]
+struct SignalForwardingGuard {
+    previous: Vec<(nix::sys::signal::Signal, nix::sys::signal::SigAction)>,
+}
+
+#[cfg(unix)]
+impl SignalForwardingGuard {
+    /// Installs a handler for each forwarded signal. Returns `None`, restoring
+    /// any handler it already installed, if installation fails.
+    fn install() -> Option<Self> {
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, sigaction};
+
+        let action = SigAction::new(
+            SigHandler::Handler(forward_termination_signal),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        let mut previous = Vec::with_capacity(FORWARDED_SIGNALS.len());
+        for signal in FORWARDED_SIGNALS {
+            // SAFETY: the handler only reads an atomic and calls async-signal-safe
+            // functions; the saved disposition is restored when this guard drops.
+            match unsafe { sigaction(signal, &action) } {
+                Ok(old) => previous.push((signal, old)),
+                Err(_) => {
+                    restore_signal_dispositions(&previous);
+                    return None;
+                }
+            }
+        }
+        Some(Self { previous })
+    }
+
+    /// Points forwarding at the child that was just spawned.
+    fn set_child_pid(&self, pid: Option<u32>) {
+        use std::sync::atomic::Ordering;
+
+        FORWARDED_CHILD_PID.store(pid.map_or(0, u32::cast_signed), Ordering::Relaxed);
+    }
+
+    /// Stops forwarding before the child's pid can be reused.
+    fn clear_child_pid(&self) {
+        FORWARDED_CHILD_PID.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalForwardingGuard {
+    fn drop(&mut self) {
+        self.clear_child_pid();
+        restore_signal_dispositions(&self.previous);
+    }
+}
+
+/// Restores the signal dispositions saved by [`SignalForwardingGuard::install`].
+#[cfg(unix)]
+fn restore_signal_dispositions(
+    previous: &[(nix::sys::signal::Signal, nix::sys::signal::SigAction)],
+) {
+    use nix::sys::signal::sigaction;
+
+    for (signal, action) in previous {
+        // SAFETY: restores a disposition previously returned by `sigaction`.
+        let _ = unsafe { sigaction(*signal, action) };
     }
 }
 
@@ -681,6 +793,69 @@ mod tests {
                     .to_string()
                     .contains("could not resolve the full path of program 'npm-not-exists'")
             );
+        }
+    }
+
+    #[cfg(unix)]
+    mod execute_with_terminal_guard_tests {
+        use std::{fs, process::Stdio, time::Duration};
+
+        use nix::sys::signal::{Signal, raise};
+
+        use super::*;
+
+        /// Runs a child that traps `trap`, sends `signal` to this process while
+        /// the child runs, and checks the child received it and its status was
+        /// returned.
+        async fn assert_signal_forwarded(signal: Signal, trap: &str) {
+            let temp_dir = create_temp_dir();
+            let ready_marker = temp_dir.path().join("ready");
+            let out_file = temp_dir.path().join("out.txt");
+
+            // The polling loop bounds how long the child can outlive a failed
+            // assertion, so a regression cannot leak a child process.
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg(format!(
+                    "trap 'echo caught; exit 0' {trap}; touch {ready}; \
+                     i=0; while [ \"$i\" -lt 300 ]; do i=$((i + 1)); sleep 0.1; done",
+                    ready = ready_marker.display(),
+                ))
+                .stdout(Stdio::from(fs::File::create(&out_file).unwrap()))
+                .stderr(Stdio::null());
+
+            let child = tokio::spawn(execute_with_terminal_guard(cmd));
+
+            // The marker is created after the handler was installed and the
+            // child's pid was registered for forwarding.
+            let mut started = false;
+            for _ in 0..200 {
+                if ready_marker.exists() {
+                    started = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(started, "child did not start");
+
+            // SAFETY: raises the signal in this process only; the guard
+            // installed by `execute_with_terminal_guard` handles it.
+            raise(signal).unwrap();
+
+            let status = tokio::time::timeout(Duration::from_secs(10), child)
+                .await
+                .expect("timed out waiting for the child; the signal was not forwarded")
+                .unwrap()
+                .unwrap();
+            assert!(status.success(), "child did not exit successfully: {status:?}");
+            let captured = fs::read_to_string(&out_file).unwrap();
+            assert!(captured.contains("caught"), "child did not receive {signal}: {captured:?}");
+        }
+
+        #[tokio::test]
+        async fn forwards_termination_signals_to_the_child() {
+            assert_signal_forwarded(Signal::SIGTERM, "TERM").await;
+            assert_signal_forwarded(Signal::SIGINT, "INT").await;
         }
     }
 }
